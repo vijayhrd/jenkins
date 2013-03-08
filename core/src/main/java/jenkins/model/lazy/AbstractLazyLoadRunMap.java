@@ -23,7 +23,9 @@
  */
 package jenkins.model.lazy;
 
+import hudson.model.Job;
 import hudson.model.Run;
+import hudson.model.RunMap;
 import org.apache.commons.collections.keyvalue.DefaultMapEntry;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -200,11 +202,19 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer,R> i
             loadIdOnDisk();
     }
 
+    /**
+     * @return true if {@link AbstractLazyLoadRunMap#AbstractLazyLoadRunMap} was called with a non-null param, or {@link RunMap#load(Job, RunMap.Constructor)} was called
+     */
+    @Restricted(NoExternalUse.class)
+    public final boolean baseDirInitialized() {
+        return dir != null;
+    }
+
     private void loadIdOnDisk() {
         String[] buildDirs = dir.list(createDirectoryFilter());
         if (buildDirs==null) {
+            // the job may have just been created
             buildDirs=EMPTY_STRING_ARRAY;
-            LOGGER.log(Level.WARNING, "failed to load list of builds from {0}", dir);
         }
         // wrap into ArrayList to enable mutation
         Arrays.sort(buildDirs);
@@ -240,6 +250,7 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer,R> i
 
     @Override
     public Set<Entry<Integer, R>> entrySet() {
+        assert baseDirInitialized();
         return Collections.unmodifiableSet(new BuildReferenceMapAdapter<R>(this,all()).entrySet());
     }
 
@@ -625,6 +636,7 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer,R> i
 
 
     protected R load(String id, Index editInPlace) {
+        assert dir != null;
         R v = load(new File(dir, id), editInPlace);
         if (v==null && editInPlace!=null) {
             // remember the failure.
