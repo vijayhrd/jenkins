@@ -27,6 +27,7 @@ package hudson.model;
 
 import hudson.PluginManager;
 import hudson.PluginWrapper;
+import hudson.ProxyConfiguration;
 import hudson.lifecycle.Lifecycle;
 import hudson.model.UpdateCenter.UpdateCenterJob;
 import hudson.util.FormValidation;
@@ -48,7 +49,11 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.URLEncoder;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -57,6 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -79,18 +85,20 @@ import static hudson.util.TimeUnit2.*;
 public class UpdateSite {
     /**
      * What's the time stamp of data file?
+     * 0 means never.
      */
-    private transient long dataTimestamp = -1;
+    private transient volatile long dataTimestamp;
 
     /**
      * When was the last time we asked a browser to check the data for us?
+     * 0 means never.
      *
      * <p>
      * There's normally some delay between when we send HTML that includes the check code,
      * until we get the data back, so this variable is used to avoid asking too many browseres
      * all at once.
      */
-    private transient volatile long lastAttempt = -1;
+    private transient volatile long lastAttempt;
 
     /**
      * If the attempt to fetch data fails, we progressively use longer time out before retrying,
@@ -124,14 +132,6 @@ public class UpdateSite {
     }
 
     /**
-     * When read back from XML, initialize them back to -1.
-     */
-    private Object readResolve() {
-        dataTimestamp = lastAttempt = -1;
-        return this;
-    }
-
-    /**
      * Get ID string.
      */
     @Exported
@@ -141,25 +141,77 @@ public class UpdateSite {
 
     @Exported
     public long getDataTimestamp() {
+        assert dataTimestamp >= 0;
         return dataTimestamp;
     }
 
     /**
+     * Update the data file from the given URL if the file
+     * does not exist, or is otherwise due for update.
+     * Accepted formats are JSONP or HTML with {@code postMessage}, not raw JSON.
+     * @param signatureCheck whether to enforce the signature (may be off only for testing!)
+     * @return null if no updates are necessary, or the future result
+     * @since 1.502
+     */
+    public Future<FormValidation> updateDirectly(final boolean signatureCheck) {
+        if (! getDataFile().exists() || isDue()) {
+            return Jenkins.getInstance().getUpdateCenter().updateService.submit(new Callable<FormValidation>() {
+                
+                public FormValidation call() throws Exception {
+                    URL src = new URL(getUrl() + "?id=" + URLEncoder.encode(getId(),"UTF-8") 
+                            + "&version="+URLEncoder.encode(Jenkins.VERSION, "UTF-8"));
+                    URLConnection conn = ProxyConfiguration.open(src);
+                    InputStream is = conn.getInputStream();
+                    try {
+                        String uncleanJson = IOUtils.toString(is,"UTF-8");
+                        int jsonStart = uncleanJson.indexOf("{\"");
+                        if (jsonStart >= 0) {
+                            uncleanJson = uncleanJson.substring(jsonStart);
+                            int end = uncleanJson.lastIndexOf('}');
+                            if (end>0)
+                                uncleanJson = uncleanJson.substring(0,end+1);
+                            return updateData(uncleanJson, signatureCheck);
+                        } else {
+                            throw new IOException("Could not find json in content of " +
+                            		"update center from url: "+src.toExternalForm());
+                        }
+                    } finally {
+                        if (is != null)
+                            is.close();
+                    }
+                }
+            });
+        }
+            return null;
+    }
+    
+    /**
      * This is the endpoint that receives the update center data file from the browser.
      */
     public FormValidation doPostBack(StaplerRequest req) throws IOException, GeneralSecurityException {
+        return updateData(IOUtils.toString(req.getInputStream(),"UTF-8"), true);
+    }
+
+    private FormValidation updateData(String json, boolean signatureCheck)
+            throws IOException {
+
         dataTimestamp = System.currentTimeMillis();
-        String json = IOUtils.toString(req.getInputStream(),"UTF-8");
+
         JSONObject o = JSONObject.fromObject(json);
 
-        int v = o.getInt("updateCenterVersion");
-        if(v !=1)
-            throw new IllegalArgumentException("Unrecognized update center version: "+v);
+        try {
+            int v = o.getInt("updateCenterVersion");
+            if (v != 1) {
+                throw new IllegalArgumentException("Unrecognized update center version: " + v);
+            }
+        } catch (JSONException x) {
+            throw new IllegalArgumentException("Could not find (numeric) updateCenterVersion in " + json, x);
+        }
 
         if (signatureCheck) {
             FormValidation e = verifySignature(o);
             if (e.kind!=Kind.OK) {
-                LOGGER.severe(e.renderHtml());
+                LOGGER.severe(e.toString());
                 return e;
             }
         }
@@ -186,7 +238,7 @@ public class UpdateSite {
      */
     public boolean isDue() {
         if(neverUpdate)     return false;
-        if(dataTimestamp==-1)
+        if(dataTimestamp == 0)
             dataTimestamp = getDataFile().file.lastModified();
         long now = System.currentTimeMillis();
         
@@ -730,8 +782,4 @@ public class UpdateSite {
     // The name uses UpdateCenter for compatibility reason.
     public static boolean neverUpdate = Boolean.getBoolean(UpdateCenter.class.getName()+".never");
 
-    /**
-     * Off by default until we know this is reasonably working.
-     */
-    public static boolean signatureCheck = true; // Boolean.getBoolean(UpdateCenter.class.getName()+".signatureCheck");
 }
